@@ -2,8 +2,10 @@
 require('dotenv').config();            // load .env into process.env
 const express = require('express');    // load express
 const db = require('./db');            // our db helper (db.js)
-const app = express();                 // create the Express "app"
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
 
+const app = express();                 // create the Express "app"
 app.use(express.json());               // middleware to parse JSON bodies
 
 // simple request logger (helpful while developing)
@@ -81,6 +83,147 @@ app.post('/redeem', async (req, res) => {
     client.release();
   }
 });
+app.post('/register', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    // Validate input
+    if (!email || !password || password.length < 6) {
+      return res.status(400).json({ error: 'Email and password (min 6 chars) required' });
+    }
+
+    // Hash the password
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    // Insert into DB
+    const sql = `
+      INSERT INTO users (email, password_hash)
+      VALUES ($1, $2)
+      RETURNING id, email, created_at
+    `;
+    const result = await db.query(sql, [email, passwordHash]);
+
+    return res.status(201).json({
+      status: 'registered',
+      user: result.rows[0]
+    });
+
+  } catch (err) {
+    console.error('register error:', err.message);
+
+    if (err.code === '23505') {
+      // Unique constraint error (email already exists)
+      return res.status(400).json({ error: 'Email already in use' });
+    }
+
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+
+app.post('/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ error: 'email and password required' });
+    }
+
+    // Find user
+    const sql = 'SELECT * FROM users WHERE email=$1';
+    const result = await db.query(sql, [email]);
+
+    if (result.rowCount === 0) {
+      // don't reveal whether email exists
+      return res.status(400).json({ error: 'invalid credentials' });
+    }
+
+    const user = result.rows[0];
+
+    // Compare password with stored hash
+    const ok = await bcrypt.compare(password, user.password_hash);
+    if (!ok) {
+      return res.status(400).json({ error: 'invalid credentials' });
+    }
+
+    // Sign JWT
+    const token = jwt.sign(
+      { userId: user.id, email: user.email },
+      process.env.JWT_SECRET || 'dev_secret_change_me',
+      { expiresIn: '1h' }
+    );
+
+    return res.json({ status: 'logged_in', token });
+
+  } catch (err) {
+    console.error('login error:', err.message || err);
+    return res.status(500).json({ error: 'internal server error' });
+  }
+});
+
+// LOGIN - issue JWT
+app.post('/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ error: 'email and password required' });
+    }
+
+    // fetch user by email
+    const sql = 'SELECT * FROM users WHERE email=$1';
+    const result = await db.query(sql, [email]);
+
+    if (result.rowCount === 0) {
+      return res.status(400).json({ error: 'invalid credentials' });
+    }
+
+    const user = result.rows[0];
+
+    // compare password with stored bcrypt hash
+    const ok = await bcrypt.compare(password, user.password_hash);
+    if (!ok) {
+      return res.status(400).json({ error: 'invalid credentials' });
+    }
+
+    // sign a JWT (1 hour)
+    const token = jwt.sign(
+      { userId: user.id, email: user.email },
+      process.env.JWT_SECRET || 'dev_secret_change_me',
+      { expiresIn: '1h' }
+    );
+
+    return res.json({ status: 'logged_in', token });
+
+  } catch (err) {
+    console.error('login error:', err.message || err);
+    return res.status(500).json({ error: 'internal server error' });
+  }
+});
+
+// AUTH middleware — verifies JWT and attaches user payload to req.user
+function auth(req, res, next) {
+  const header = req.headers['authorization'];
+  if (!header || !header.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'missing or invalid Authorization header' });
+  }
+
+  const token = header.slice(7); // remove "Bearer "
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET || 'dev_secret_change_me');
+    req.user = payload; // { userId, email, iat, exp }
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'invalid or expired token' });
+  }
+}
+
+// Protected example route — use this to test your token
+app.get('/protected-example', auth, (req, res) => {
+  // req.user is available here
+  return res.json({ ok: true, message: `Hello ${req.user.email}`, user: req.user });
+});
+
+
+
 
 // catch-all 404 for any other route
 app.use((req, res) => {
