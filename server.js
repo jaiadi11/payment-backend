@@ -20,6 +20,56 @@ app.get('/', (req, res) => {
   res.send('Server is running ✔');
 });
 
+async function debitWalletWithTransaction({ walletName, amount, code }) {
+  const client = await db.getClient();
+
+  try {
+    await client.query('BEGIN');
+
+    // 1. Lock the wallet row
+    const walletRes = await client.query(
+      'SELECT * FROM wallets WHERE name=$1 FOR UPDATE',
+      [walletName]
+    );
+
+    if (walletRes.rowCount === 0) {
+      throw new Error('wallet not found');
+    }
+
+    const wallet = walletRes.rows[0];
+
+    // 2. Check balance
+    if (wallet.balance < amount) {
+      throw new Error('insufficient balance');
+    }
+
+    // 3. Update wallet balance
+    await client.query(
+      'UPDATE wallets SET balance = balance - $1 WHERE id=$2',
+      [amount, wallet.id]
+    );
+
+    // 4. Insert transaction log
+    await client.query(
+      `
+      INSERT INTO transactions (wallet_id, type, amount, code)
+      VALUES ($1, 'debit', $2, $3)
+      `,
+      [wallet.id, amount, code]
+    );
+
+    await client.query('COMMIT');
+    return { ok: true };
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+
 // CREATE CODE - writes into DB
 app.post('/create-code', async (req, res) => {
   try {
@@ -70,11 +120,26 @@ app.post('/redeem', async (req, res) => {
       return res.status(400).json({ error: 'code already used' });
     }
 
-    await client.query('UPDATE codes SET status=$1 WHERE code=$2', ['used', code]);
-    await client.query('COMMIT');
+    // debit intermediate wallet + log transaction
+await debitWalletWithTransaction({
+  walletName: 'intermediate',
+  amount: row.amount,
+  code: code
+});
 
-    console.log('HANDLER -> POST /redeem succeeded for', code);
-    return res.json({ status: 'redeemed', amount: row.amount });
+// mark code as used
+await client.query(
+  'UPDATE codes SET status=$1 WHERE code=$2',
+  ['used', code]
+);
+
+await client.query('COMMIT');
+
+return res.json({
+  status: 'redeemed',
+  amount: row.amount
+});
+
   } catch (err) {
     await client.query('ROLLBACK').catch(()=>{/* ignore rollback error */});
     console.error('redeem error:', err.message || err);
