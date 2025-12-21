@@ -1,11 +1,14 @@
 // server.js - DB-aware complete server (overwrite your file with this)
 require('dotenv').config();            // load .env into process.env
+const cors = require('cors');
 const express = require('express');    // load express
 const db = require('./db');            // our db helper (db.js)
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 
 const app = express();                 // create the Express "app"
+app.use(cors());
+
 app.use(express.json());               // middleware to parse JSON bodies
 
 // simple request logger (helpful while developing)
@@ -20,54 +23,42 @@ app.get('/', (req, res) => {
   res.send('Server is running ✔');
 });
 
-async function debitWalletWithTransaction({ walletName, amount, code }) {
-  const client = await db.getClient();
+async function debitWalletWithTransaction(
+  client,
+  walletName,
+  amount,
+  code
+) {
+  // 1. Lock wallet row
+  const walletRes = await client.query(
+    'SELECT * FROM wallets WHERE name=$1 FOR UPDATE',
+    [walletName]
+  );
 
-  try {
-    await client.query('BEGIN');
-
-    // 1. Lock the wallet row
-    const walletRes = await client.query(
-      'SELECT * FROM wallets WHERE name=$1 FOR UPDATE',
-      [walletName]
-    );
-
-    if (walletRes.rowCount === 0) {
-      throw new Error('wallet not found');
-    }
-
-    const wallet = walletRes.rows[0];
-
-    // 2. Check balance
-    if (wallet.balance < amount) {
-      throw new Error('insufficient balance');
-    }
-
-    // 3. Update wallet balance
-    await client.query(
-      'UPDATE wallets SET balance = balance - $1 WHERE id=$2',
-      [amount, wallet.id]
-    );
-
-    // 4. Insert transaction log
-    await client.query(
-      `
-      INSERT INTO transactions (wallet_id, type, amount, code)
-      VALUES ($1, 'debit', $2, $3)
-      `,
-      [wallet.id, amount, code]
-    );
-
-    await client.query('COMMIT');
-    return { ok: true };
-
-  } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
-  } finally {
-    client.release();
+  if (walletRes.rowCount === 0) {
+    throw new Error('wallet not found');
   }
+
+  const wallet = walletRes.rows[0];
+
+  if (wallet.balance < amount) {
+    throw new Error('insufficient balance');
+  }
+
+  // 2. Debit wallet
+  await client.query(
+    'UPDATE wallets SET balance = balance - $1 WHERE name=$2',
+    [amount, walletName]
+  );
+
+  // 3. Log transaction
+  await client.query(
+    `INSERT INTO transactions (wallet_id, amount, type, code)
+     VALUES ($1, $2, 'debit', $3)`,
+    [wallet.id, amount, code]
+  );
 }
+
 
 
 // CREATE CODE - writes into DB
@@ -121,11 +112,13 @@ app.post('/redeem', async (req, res) => {
     }
 
     // debit intermediate wallet + log transaction
-await debitWalletWithTransaction({
-  walletName: 'intermediate',
-  amount: row.amount,
-  code: code
-});
+await debitWalletWithTransaction(
+  client,
+  'intermediate',
+  row.amount,
+  code
+);
+
 
 // mark code as used
 await client.query(
