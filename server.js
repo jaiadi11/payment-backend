@@ -23,6 +23,63 @@ app.get('/', (req, res) => {
   res.send('Server is running ✔');
 });
 
+function requireAuth(req, res, next) {
+  const header = req.headers.authorization;
+
+  if (!header || !header.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'missing auth token' });
+  }
+
+  const token = header.split(' ')[1];
+
+  try {
+    const payload = jwt.verify(
+      token,
+      process.env.JWT_SECRET || 'dev_secret_change_me'
+    );
+
+    // attach user info to request
+    req.user = payload; // { userId, email }
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'invalid or expired token' });
+  }
+}
+
+
+async function creditWalletWithTransaction(
+  client,
+  walletName,
+  amount,
+  code
+) {
+  // 1. Lock wallet row
+  const walletRes = await client.query(
+    'SELECT * FROM wallets WHERE name=$1 FOR UPDATE',
+    [walletName]
+  );
+
+  if (walletRes.rowCount === 0) {
+    throw new Error('wallet not found');
+  }
+
+  const wallet = walletRes.rows[0];
+
+  // 2. Credit wallet
+  await client.query(
+    'UPDATE wallets SET balance = balance + $1 WHERE name=$2',
+    [amount, walletName]
+  );
+
+  // 3. Log transaction
+  await client.query(
+    `INSERT INTO transactions (wallet_id, amount, type, code)
+     VALUES ($1, $2, 'credit', $3)`,
+    [wallet.id, amount,code]
+  );
+}
+
+
 async function debitWalletWithTransaction(
   client,
   walletName,
@@ -59,32 +116,73 @@ async function debitWalletWithTransaction(
   );
 }
 
+function generatePaymentCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no confusing chars
+  let code = '';
+  for (let i = 0; i < 5; i++) {
+    code += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return code;
+}
+
+function generatePaymentCode(userId) {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no confusing chars
+  let randomPart = '';
+
+  for (let i = 0; i < 3; i++) {
+    randomPart += chars[Math.floor(Math.random() * chars.length)];
+  }
+
+  const userPart = String(userId).slice(-2).padStart(2, '0');
+
+  return `U${userPart}${randomPart}`;
+}
+
+
+
+
 
 
 // CREATE CODE - writes into DB
-app.post('/create-code', async (req, res) => {
+app.post('/create-code', requireAuth, async (req, res) => {
   try {
-    const { code, amount } = req.body;
-    if (!code || typeof amount !== 'number') {
-      return res.status(400).json({ error: 'code and amount required' });
+    const { amount } = req.body;
+    const userId = req.user.userId;
+
+    if (typeof amount !== 'number' || amount <= 0) {
+      return res.status(400).json({ error: 'valid amount required' });
     }
 
+    const code = generatePaymentCode(userId);
+
     const query = `
-      INSERT INTO codes (code, amount)
-      VALUES ($1, $2)
-      RETURNING id, code, amount, status, created_at
+      INSERT INTO codes (code, amount, user_id, status)
+      VALUES ($1, $2, $3, 'unused')
+      RETURNING code, amount, status, created_at
     `;
-    const result = await db.query(query, [code, amount]);
-    console.log('HANDLER -> POST /create-code inserted:', result.rows[0]);
-    return res.json({ status: 'code_created', data: result.rows[0] });
+
+    const result = await db.query(query, [code, amount, userId]);
+
+    return res.json({
+      status: 'code_created',
+      data: result.rows[0]
+    });
+
   } catch (err) {
-    console.error('create-code error:', err.message || err);
-    if (err.code === '23505') { // unique_violation
-      return res.status(400).json({ error: 'code already exists' });
+    console.error('create-code error:', err.message);
+
+    if (err.code === '23505') {
+      // rare collision → retry logic could be added later
+      return res.status(500).json({ error: 'code collision, retry' });
     }
-    return res.status(500).json({ error: 'Error inserting code' });
+
+    return res.status(500).json({ error: 'create code failed' });
   }
 });
+
+
+
+  
 
 // REDEEM - atomic check+update
 app.post('/redeem', async (req, res) => {
@@ -118,6 +216,14 @@ await debitWalletWithTransaction(
   row.amount,
   code
 );
+await creditWalletWithTransaction(
+  client,
+  'platform',
+  row.amount,
+  code
+);
+
+
 
 
 // mark code as used
@@ -217,6 +323,35 @@ app.post('/login', async (req, res) => {
     return res.status(500).json({ error: 'internal server error' });
   }
 });
+
+//pin setup
+app.post('/set-payment-pin', async (req, res) => {
+  try {
+    const { email, pin } = req.body;
+
+    if (!email || !pin || pin.length !== 4) {
+      return res.status(400).json({ error: 'email and 4-digit pin required' });
+    }
+
+    const pinHash = await bcrypt.hash(pin, 10);
+
+    const result = await db.query(
+      'UPDATE users SET payment_pin_hash=$1 WHERE email=$2 RETURNING id',
+      [pinHash, email]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'user not found' });
+    }
+
+    return res.json({ status: 'payment pin set' });
+
+  } catch (err) {
+    console.error('set-pin error:', err.message);
+    return res.status(500).json({ error: 'internal server error' });
+  }
+});
+
 
 // LOGIN - issue JWT
 app.post('/login', async (req, res) => {
